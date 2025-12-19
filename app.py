@@ -7,11 +7,13 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import json
-import os
-
-# Add parent directory to path for imports
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pathlib import Path
+
+# Fix import path for Streamlit Cloud
+app_dir = Path(__file__).parent
+if str(app_dir) not in sys.path:
+    sys.path.insert(0, str(app_dir))
 
 from calculators.paye import calculate_paye
 from calculators.contractor import calculate_contractor_tax, compare_salary_vs_contractor
