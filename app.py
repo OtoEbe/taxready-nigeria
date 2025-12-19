@@ -1,29 +1,334 @@
 """
 TaxReady Nigeria - Tax Compliance Made Simple
 MVP for Nigeria Tax Act 2025 (Effective January 1, 2026)
+
+Single-file version for Streamlit Cloud deployment
 """
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import json
-import sys
-from pathlib import Path
 
-# Fix import path for Streamlit Cloud
-app_dir = Path(__file__).parent
-if str(app_dir) not in sys.path:
-    sys.path.insert(0, str(app_dir))
+# ============================================
+# CONSTANTS (from utils/constants.py)
+# ============================================
 
-from calculators.paye import calculate_paye
-from calculators.contractor import calculate_contractor_tax, compare_salary_vs_contractor
-from utils.constants import (
-    TAX_BANDS_2026, EXPENSE_CATEGORIES, INCOME_CATEGORIES,
-    FILING_DEADLINES, PENALTIES, VAT_REGISTRATION_THRESHOLD,
-    SMALL_COMPANY_TURNOVER_LIMIT, MONTHS
-)
+# 2026 Personal Income Tax Bands
+TAX_BANDS_2026 = [
+    {"min": 0, "max": 800_000, "rate": 0.00, "label": "First ₦800,000"},
+    {"min": 800_000, "max": 3_000_000, "rate": 0.15, "label": "₦800,001 - ₦3,000,000"},
+    {"min": 3_000_000, "max": 12_000_000, "rate": 0.18, "label": "₦3,000,001 - ₦12,000,000"},
+    {"min": 12_000_000, "max": 25_000_000, "rate": 0.21, "label": "₦12,000,001 - ₦25,000,000"},
+    {"min": 25_000_000, "max": 50_000_000, "rate": 0.23, "label": "₦25,000,001 - ₦50,000,000"},
+    {"min": 50_000_000, "max": float('inf'), "rate": 0.25, "label": "Above ₦50,000,000"},
+]
 
-# Page config
+# Statutory Deduction Rates
+PENSION_RATE = 0.08
+NHF_RATE = 0.025
+NHF_ANNUAL_CAP = 2_400
+NHIS_RATE = 0.05
+
+# Relief Caps
+RENT_RELIEF_RATE = 0.20
+RENT_RELIEF_CAP = 500_000
+LIFE_ASSURANCE_CAP = 100_000
+
+# Thresholds
+SMALL_COMPANY_TURNOVER_LIMIT = 100_000_000
+VAT_REGISTRATION_THRESHOLD = 25_000_000
+
+# WHT Rates
+WHT_RATES = {
+    "professional_services": 0.10,
+    "consultancy": 0.10,
+    "technical_services": 0.10,
+    "contracts": 0.05,
+    "supplies": 0.05,
+    "rent": 0.10,
+}
+
+# Penalties
+PENALTIES = {
+    "late_filing_first": 50_000,
+    "late_filing_subsequent": 25_000,
+    "unregistered_contractor": 5_000_000,
+}
+
+# Filing Deadlines
+FILING_DEADLINES = {
+    "paye_monthly": "10th of following month",
+    "vat_monthly": "21st of following month",
+    "annual_return": "Within 6 months of year end",
+}
+
+# Categories
+EXPENSE_CATEGORIES = [
+    "Office Rent/Workspace", "Utilities (Power, Water)", "Internet & Communications",
+    "Equipment & Software", "Professional Subscriptions", "Accounting/Legal Fees",
+    "Marketing & Advertising", "Travel & Transportation", "Subcontractor Payments",
+    "Insurance", "Bank Charges", "Office Supplies", "Training & Development",
+    "Other Business Expenses",
+]
+
+INCOME_CATEGORIES = [
+    "Consulting/Professional Fees", "Contract Payments", "Retainer Income",
+    "Project-Based Income", "Royalties/Licensing", "Training/Speaking Fees",
+    "Other Business Income",
+]
+
+MONTHS = ["January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"]
+
+
+# ============================================
+# PAYE CALCULATOR (from calculators/paye.py)
+# ============================================
+
+def calculate_pension(basic: float, housing: float, transport: float) -> float:
+    pensionable = basic + housing + transport
+    return pensionable * PENSION_RATE
+
+def calculate_nhf(basic: float) -> float:
+    nhf = basic * NHF_RATE
+    return min(nhf, NHF_ANNUAL_CAP)
+
+def calculate_nhis(basic: float) -> float:
+    return basic * NHIS_RATE
+
+def calculate_rent_relief(gross_income: float) -> float:
+    relief = gross_income * RENT_RELIEF_RATE
+    return min(relief, RENT_RELIEF_CAP)
+
+def calculate_tax_on_income(taxable_income: float) -> dict:
+    remaining = taxable_income
+    total_tax = 0
+    breakdown = []
+    
+    for band in TAX_BANDS_2026:
+        if remaining <= 0:
+            breakdown.append({
+                "band": band["label"],
+                "rate": f"{band['rate']*100:.0f}%",
+                "taxable_amount": 0,
+                "tax": 0
+            })
+            continue
+        
+        band_size = band["max"] - band["min"]
+        amount_in_band = min(remaining, band_size)
+        tax_in_band = amount_in_band * band["rate"]
+        
+        breakdown.append({
+            "band": band["label"],
+            "rate": f"{band['rate']*100:.0f}%",
+            "taxable_amount": amount_in_band,
+            "tax": tax_in_band
+        })
+        
+        total_tax += tax_in_band
+        remaining -= amount_in_band
+    
+    return {"breakdown": breakdown, "total_tax": total_tax}
+
+def calculate_paye(
+    basic_monthly: float,
+    housing_monthly: float = 0,
+    transport_monthly: float = 0,
+    other_allowances_monthly: float = 0,
+    bonus_annual: float = 0,
+    life_assurance: float = 0,
+    mortgage_interest: float = 0,
+    include_pension: bool = True,
+    include_nhf: bool = True,
+    include_nhis: bool = True
+) -> dict:
+    # Convert to annual
+    basic_annual = basic_monthly * 12
+    housing_annual = housing_monthly * 12
+    transport_annual = transport_monthly * 12
+    other_annual = other_allowances_monthly * 12
+    
+    gross_annual = basic_annual + housing_annual + transport_annual + other_annual + bonus_annual
+    gross_monthly = gross_annual / 12
+    
+    deductions = {}
+    total_deductions = 0
+    
+    if include_pension:
+        pension = calculate_pension(basic_annual, housing_annual, transport_annual)
+        deductions["Pension (8%)"] = pension
+        total_deductions += pension
+    
+    if include_nhf:
+        nhf = calculate_nhf(basic_annual)
+        deductions["NHF (2.5%, capped)"] = nhf
+        total_deductions += nhf
+    
+    if include_nhis:
+        nhis = calculate_nhis(basic_annual)
+        deductions["NHIS (5%)"] = nhis
+        total_deductions += nhis
+    
+    rent_relief = calculate_rent_relief(gross_annual)
+    deductions["Rent Relief (20%, max ₦500k)"] = rent_relief
+    total_deductions += rent_relief
+    
+    life_assurance_relief = min(life_assurance, LIFE_ASSURANCE_CAP)
+    if life_assurance_relief > 0:
+        deductions["Life Assurance"] = life_assurance_relief
+        total_deductions += life_assurance_relief
+    
+    if mortgage_interest > 0:
+        deductions["Mortgage Interest"] = mortgage_interest
+        total_deductions += mortgage_interest
+    
+    taxable_income = max(gross_annual - total_deductions, 0)
+    tax_result = calculate_tax_on_income(taxable_income)
+    annual_tax = tax_result["total_tax"]
+    monthly_tax = annual_tax / 12
+    effective_rate = (annual_tax / gross_annual * 100) if gross_annual > 0 else 0
+    net_annual = gross_annual - annual_tax
+    net_monthly = net_annual / 12
+    
+    return {
+        "income": {
+            "basic_annual": basic_annual,
+            "housing_annual": housing_annual,
+            "transport_annual": transport_annual,
+            "other_annual": other_annual,
+            "bonus_annual": bonus_annual,
+            "gross_annual": gross_annual,
+            "gross_monthly": gross_monthly,
+        },
+        "deductions": deductions,
+        "total_deductions": total_deductions,
+        "taxable_income": taxable_income,
+        "tax_breakdown": tax_result["breakdown"],
+        "annual_tax": annual_tax,
+        "monthly_tax": monthly_tax,
+        "effective_rate": effective_rate,
+        "net_annual": net_annual,
+        "net_monthly": net_monthly,
+    }
+
+
+# ============================================
+# CONTRACTOR CALCULATOR (from calculators/contractor.py)
+# ============================================
+
+def calculate_contractor_tax(
+    gross_revenue: float,
+    business_expenses: dict = None,
+    voluntary_pension: float = 0,
+    life_assurance: float = 0,
+    wht_credits: float = 0
+) -> dict:
+    if business_expenses is None:
+        business_expenses = {}
+    
+    total_expenses = sum(business_expenses.values())
+    gross_profit = gross_revenue - total_expenses
+    
+    reliefs = {}
+    total_reliefs = 0
+    
+    rent_relief = min(gross_revenue * RENT_RELIEF_RATE, RENT_RELIEF_CAP)
+    reliefs["Rent Relief (20%, max ₦500k)"] = rent_relief
+    total_reliefs += rent_relief
+    
+    max_pension = gross_revenue * PENSION_RATE
+    pension_relief = min(voluntary_pension, max_pension)
+    if pension_relief > 0:
+        reliefs["Voluntary Pension"] = pension_relief
+        total_reliefs += pension_relief
+    
+    life_relief = min(life_assurance, LIFE_ASSURANCE_CAP)
+    if life_relief > 0:
+        reliefs["Life Assurance"] = life_relief
+        total_reliefs += life_relief
+    
+    taxable_income = max(gross_profit - total_reliefs, 0)
+    tax_result = calculate_tax_on_income(taxable_income)
+    tax_before_credits = tax_result["total_tax"]
+    
+    net_tax_payable = max(tax_before_credits - wht_credits, 0)
+    wht_refund = max(wht_credits - tax_before_credits, 0)
+    
+    effective_rate_revenue = (net_tax_payable / gross_revenue * 100) if gross_revenue > 0 else 0
+    effective_rate_profit = (net_tax_payable / gross_profit * 100) if gross_profit > 0 else 0
+    
+    vat_registration_required = gross_revenue > VAT_REGISTRATION_THRESHOLD
+    qualifies_small_company = gross_revenue <= SMALL_COMPANY_TURNOVER_LIMIT
+    
+    return {
+        "revenue": {"gross_revenue": gross_revenue},
+        "expenses": {"breakdown": business_expenses, "total": total_expenses},
+        "gross_profit": gross_profit,
+        "reliefs": reliefs,
+        "total_reliefs": total_reliefs,
+        "taxable_income": taxable_income,
+        "tax_breakdown": tax_result["breakdown"],
+        "tax_before_credits": tax_before_credits,
+        "wht_credits": wht_credits,
+        "net_tax_payable": net_tax_payable,
+        "wht_refund": wht_refund,
+        "effective_rate_revenue": effective_rate_revenue,
+        "effective_rate_profit": effective_rate_profit,
+        "vat_registration_required": vat_registration_required,
+        "qualifies_small_company": qualifies_small_company,
+        "profit_margin": (gross_profit / gross_revenue * 100) if gross_revenue > 0 else 0,
+    }
+
+def compare_salary_vs_contractor(gross_amount: float, expense_ratio: float = 0.3) -> dict:
+    monthly = gross_amount / 12
+    basic = monthly * 0.5
+    housing = monthly * 0.25
+    transport = monthly * 0.15
+    other = monthly * 0.10
+    
+    employee_result = calculate_paye(
+        basic_monthly=basic,
+        housing_monthly=housing,
+        transport_monthly=transport,
+        other_allowances_monthly=other
+    )
+    
+    expenses = {"Estimated Business Expenses": gross_amount * expense_ratio}
+    contractor_result = calculate_contractor_tax(
+        gross_revenue=gross_amount,
+        business_expenses=expenses,
+        voluntary_pension=gross_amount * PENSION_RATE,
+        wht_credits=gross_amount * 0.05
+    )
+    
+    employee_tax = employee_result["annual_tax"]
+    contractor_tax = contractor_result["net_tax_payable"]
+    tax_difference = employee_tax - contractor_tax
+    
+    return {
+        "gross_amount": gross_amount,
+        "employee": {
+            "annual_tax": employee_tax,
+            "effective_rate": employee_result["effective_rate"],
+            "net_income": employee_result["net_annual"],
+        },
+        "contractor": {
+            "annual_tax": contractor_tax,
+            "effective_rate": contractor_result["effective_rate_revenue"],
+            "net_income": gross_amount - contractor_tax,
+            "expenses_claimed": gross_amount * expense_ratio,
+        },
+        "tax_savings_as_contractor": tax_difference,
+        "recommendation": "Contractor" if tax_difference > 0 else "Employee",
+    }
+
+
+# ============================================
+# STREAMLIT APP
+# ============================================
+
 st.set_page_config(
     page_title="TaxReady Nigeria",
     page_icon="🇳🇬",
@@ -34,82 +339,22 @@ st.set_page_config(
 # Custom CSS
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: #1B4D3E;
-        margin-bottom: 0;
-    }
-    .sub-header {
-        font-size: 1.1rem;
-        color: #666;
-        margin-top: 0;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #1B4D3E 0%, #2E7D5B 100%);
-        padding: 1.5rem;
-        border-radius: 10px;
-        color: white;
-    }
-    .warning-box {
-        background-color: #FFF3CD;
-        border-left: 4px solid #FFC107;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 0 8px 8px 0;
-    }
-    .success-box {
-        background-color: #D4EDDA;
-        border-left: 4px solid #28A745;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 0 8px 8px 0;
-    }
-    .info-box {
-        background-color: #D1ECF1;
-        border-left: 4px solid #17A2B8;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 0 8px 8px 0;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #f0f2f6;
-        border-radius: 8px 8px 0 0;
-        padding: 10px 20px;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #1B4D3E;
-        color: white;
-    }
+    .main-header { font-size: 2.5rem; font-weight: 700; color: #1B4D3E; margin-bottom: 0; }
+    .sub-header { font-size: 1.1rem; color: #666; margin-top: 0; }
+    .info-box { background-color: #D1ECF1; border-left: 4px solid #17A2B8; padding: 1rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
+    .warning-box { background-color: #FFF3CD; border-left: 4px solid #FFC107; padding: 1rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
+    .success-box { background-color: #D4EDDA; border-left: 4px solid #28A745; padding: 1rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-
 def format_currency(amount: float) -> str:
-    """Format number as Nigerian Naira"""
     return f"₦{amount:,.2f}"
-
-
-def format_currency_short(amount: float) -> str:
-    """Format large numbers in millions/thousands"""
-    if amount >= 1_000_000:
-        return f"₦{amount/1_000_000:.1f}M"
-    elif amount >= 1_000:
-        return f"₦{amount/1_000:.1f}K"
-    return f"₦{amount:,.0f}"
-
 
 # Initialize session state
 if 'records' not in st.session_state:
     st.session_state.records = {"income": [], "expenses": []}
-if 'user_type' not in st.session_state:
-    st.session_state.user_type = None
 
-
-# Sidebar Navigation
+# Sidebar
 st.sidebar.markdown("## 🇳🇬 TaxReady Nigeria")
 st.sidebar.markdown("*Tax Compliance Made Simple*")
 st.sidebar.markdown("---")
@@ -124,22 +369,11 @@ page = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📅 Key Dates")
-st.sidebar.info("""
-**PAYE Remittance:** 10th monthly  
-**VAT Filing:** 21st monthly  
-**Annual Return:** Within 6 months of year end
-""")
+st.sidebar.info("**PAYE:** 10th monthly\n\n**VAT:** 21st monthly\n\n**Annual:** Within 6 months")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚠️ New Law Alert")
-st.sidebar.warning("""
-**Nigeria Tax Act 2025** takes effect **January 1, 2026**.
-
-Key changes:
-- First ₦800K tax-free
-- CRA abolished → Rent Relief
-- ₦5M penalty for unregistered contractors
-""")
+st.sidebar.warning("**Nigeria Tax Act 2025** takes effect **January 1, 2026**.\n\n• First ₦800K tax-free\n• CRA abolished → Rent Relief\n• ₦5M penalty for unregistered contractors")
 
 
 # ============================================
@@ -148,10 +382,8 @@ Key changes:
 if page == "🏠 Home":
     st.markdown('<p class="main-header">🇳🇬 TaxReady Nigeria</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Navigate Nigeria\'s 2026 Tax Laws with Confidence</p>', unsafe_allow_html=True)
-    
     st.markdown("---")
     
-    # Alert banner
     days_until = (date(2026, 1, 1) - date.today()).days
     if days_until > 0:
         st.warning(f"⏰ **{days_until} days** until the Nigeria Tax Act 2025 takes effect. Are you ready?")
@@ -159,32 +391,14 @@ if page == "🏠 Home":
         st.success("✅ The Nigeria Tax Act 2025 is now in effect!")
     
     st.markdown("### What's New in 2026?")
-    
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.markdown("""
-        <div class="info-box">
-        <h4>💰 ₦800K Tax-Free</h4>
-        <p>First ₦800,000 of annual income is completely exempt from tax.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown('<div class="info-box"><h4>💰 ₦800K Tax-Free</h4><p>First ₦800,000 of annual income is completely exempt from tax.</p></div>', unsafe_allow_html=True)
     with col2:
-        st.markdown("""
-        <div class="info-box">
-        <h4>🏠 New Rent Relief</h4>
-        <p>20% of gross income (max ₦500K) replaces the old CRA system.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown('<div class="info-box"><h4>🏠 New Rent Relief</h4><p>20% of gross income (max ₦500K) replaces the old CRA system.</p></div>', unsafe_allow_html=True)
     with col3:
-        st.markdown("""
-        <div class="info-box">
-        <h4>⚠️ Stricter Penalties</h4>
-        <p>₦5M fine for engaging unregistered contractors. TIN now mandatory.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown('<div class="info-box"><h4>⚠️ Stricter Penalties</h4><p>₦5M fine for engaging unregistered contractors. TIN now mandatory.</p></div>', unsafe_allow_html=True)
     
     st.markdown("---")
     st.markdown("### 2026 Tax Bands at a Glance")
@@ -198,27 +412,6 @@ if page == "🏠 Home":
         {"Income Band": "Above ₦50,000,000", "Rate": "25%", "Cumulative Tax": "Continues..."},
     ])
     st.dataframe(bands_df, hide_index=True, use_container_width=True)
-    
-    st.markdown("---")
-    st.markdown("### Quick Actions")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        if st.button("💼 Calculate PAYE", use_container_width=True):
-            st.session_state.page = "💼 Employee Calculator"
-            st.rerun()
-    with col2:
-        if st.button("🧑‍💻 Contractor Tax", use_container_width=True):
-            st.session_state.page = "🧑‍💻 Contractor Calculator"
-            st.rerun()
-    with col3:
-        if st.button("⚖️ Compare Options", use_container_width=True):
-            st.session_state.page = "⚖️ Compare Options"
-            st.rerun()
-    with col4:
-        if st.button("✅ Check Compliance", use_container_width=True):
-            st.session_state.page = "✅ Compliance Checklist"
-            st.rerun()
 
 
 # ============================================
@@ -227,26 +420,21 @@ if page == "🏠 Home":
 elif page == "💼 Employee Calculator":
     st.markdown("## 💼 PAYE Calculator (Salary Earners)")
     st.markdown("Calculate your Pay-As-You-Earn tax under the **2026 tax bands**.")
-    
     st.markdown("---")
     
     col1, col2 = st.columns([1, 1])
     
     with col1:
         st.markdown("### 💵 Monthly Income")
-        
-        basic = st.number_input("Basic Salary (₦/month)", min_value=0, value=150000, step=10000,
-                               help="Your monthly basic salary")
+        basic = st.number_input("Basic Salary (₦/month)", min_value=0, value=150000, step=10000)
         housing = st.number_input("Housing Allowance (₦/month)", min_value=0, value=75000, step=5000)
         transport = st.number_input("Transport Allowance (₦/month)", min_value=0, value=45000, step=5000)
         other = st.number_input("Other Allowances (₦/month)", min_value=0, value=30000, step=5000)
         bonus = st.number_input("Annual Bonus (₦/year)", min_value=0, value=0, step=50000)
         
         st.markdown("### 🛡️ Additional Reliefs")
-        life_assurance = st.number_input("Life Assurance Premium (₦/year)", min_value=0, max_value=100000, 
-                                         value=0, step=10000, help="Maximum ₦100,000")
-        mortgage = st.number_input("Mortgage Interest (₦/year)", min_value=0, value=0, step=50000,
-                                   help="Interest on primary residence mortgage")
+        life_assurance = st.number_input("Life Assurance Premium (₦/year)", min_value=0, max_value=100000, value=0, step=10000)
+        mortgage = st.number_input("Mortgage Interest (₦/year)", min_value=0, value=0, step=50000)
         
         st.markdown("### ⚙️ Deduction Options")
         include_pension = st.checkbox("Pension Contribution (8%)", value=True)
@@ -254,34 +442,23 @@ elif page == "💼 Employee Calculator":
         include_nhis = st.checkbox("NHIS (5%)", value=True)
     
     with col2:
-        # Calculate
         result = calculate_paye(
-            basic_monthly=basic,
-            housing_monthly=housing,
-            transport_monthly=transport,
-            other_allowances_monthly=other,
-            bonus_annual=bonus,
-            life_assurance=life_assurance,
-            mortgage_interest=mortgage,
-            include_pension=include_pension,
-            include_nhf=include_nhf,
-            include_nhis=include_nhis
+            basic_monthly=basic, housing_monthly=housing, transport_monthly=transport,
+            other_allowances_monthly=other, bonus_annual=bonus, life_assurance=life_assurance,
+            mortgage_interest=mortgage, include_pension=include_pension,
+            include_nhf=include_nhf, include_nhis=include_nhis
         )
         
         st.markdown("### 📊 Tax Summary")
-        
-        # Key metrics
-        metric_col1, metric_col2 = st.columns(2)
-        with metric_col1:
+        m1, m2 = st.columns(2)
+        with m1:
             st.metric("Monthly PAYE", format_currency(result["monthly_tax"]))
             st.metric("Annual Tax", format_currency(result["annual_tax"]))
-        with metric_col2:
+        with m2:
             st.metric("Effective Rate", f"{result['effective_rate']:.2f}%")
             st.metric("Monthly Take-Home", format_currency(result["net_monthly"]))
         
         st.markdown("---")
-        
-        # Income breakdown
         st.markdown("#### 💰 Income Breakdown")
         income_df = pd.DataFrame([
             {"Component": "Basic Salary", "Annual": format_currency(result["income"]["basic_annual"])},
@@ -293,16 +470,14 @@ elif page == "💼 Employee Calculator":
         ])
         st.dataframe(income_df, hide_index=True, use_container_width=True)
         
-        # Deductions
         st.markdown("#### ➖ Deductions")
         deductions_data = [{"Deduction": k, "Amount": format_currency(v)} for k, v in result["deductions"].items()]
-        deductions_data.append({"Deduction": "**TOTAL DEDUCTIONS**", "Amount": f"**{format_currency(result['total_deductions'])}**"})
+        deductions_data.append({"Deduction": "**TOTAL**", "Amount": f"**{format_currency(result['total_deductions'])}**"})
         st.dataframe(pd.DataFrame(deductions_data), hide_index=True, use_container_width=True)
         
         st.info(f"**Taxable Income:** {format_currency(result['taxable_income'])}")
         
-        # Tax calculation
-        st.markdown("#### 🧮 Tax Calculation by Band")
+        st.markdown("#### 🧮 Tax by Band")
         tax_df = pd.DataFrame(result["tax_breakdown"])
         tax_df["taxable_amount"] = tax_df["taxable_amount"].apply(format_currency)
         tax_df["tax"] = tax_df["tax"].apply(format_currency)
@@ -316,7 +491,6 @@ elif page == "💼 Employee Calculator":
 elif page == "🧑‍💻 Contractor Calculator":
     st.markdown("## 🧑‍💻 Contractor Tax Calculator")
     st.markdown("Calculate your tax as an independent contractor or self-employed professional.")
-    
     st.markdown("---")
     
     col1, col2 = st.columns([1, 1])
@@ -326,67 +500,45 @@ elif page == "🧑‍💻 Contractor Calculator":
         gross_revenue = st.number_input("Total Annual Revenue (₦)", min_value=0, value=6000000, step=500000)
         
         st.markdown("### 📝 Business Expenses")
-        st.caption("Enter your annual business expenses by category")
-        
         expenses = {}
         with st.expander("Click to enter expenses", expanded=True):
-            for i, category in enumerate(EXPENSE_CATEGORIES[:8]):  # Show first 8 categories
-                exp = st.number_input(f"{category}", min_value=0, value=0, step=10000, key=f"exp_{i}")
+            for i, cat in enumerate(EXPENSE_CATEGORIES[:8]):
+                exp = st.number_input(f"{cat}", min_value=0, value=0, step=10000, key=f"exp_{i}")
                 if exp > 0:
-                    expenses[category] = exp
-            
-            other_exp = st.number_input("Other Business Expenses", min_value=0, value=0, step=10000)
-            if other_exp > 0:
-                expenses["Other Business Expenses"] = other_exp
+                    expenses[cat] = exp
         
         st.markdown("### 🛡️ Personal Reliefs")
-        vol_pension = st.number_input("Voluntary Pension (₦/year)", min_value=0, 
-                                       max_value=int(gross_revenue * 0.08), value=0, step=50000,
-                                       help=f"Maximum: {format_currency(gross_revenue * 0.08)} (8% of revenue)")
-        life_assurance = st.number_input("Life Assurance (₦/year)", min_value=0, max_value=100000, 
-                                          value=0, step=10000)
+        vol_pension = st.number_input("Voluntary Pension (₦/year)", min_value=0, max_value=int(gross_revenue * 0.08) if gross_revenue > 0 else 1000000, value=0, step=50000)
+        life_assurance = st.number_input("Life Assurance (₦/year)", min_value=0, max_value=100000, value=0, step=10000, key="contractor_life")
         
         st.markdown("### 💳 WHT Credits")
-        wht_credits = st.number_input("WHT Already Deducted (₦)", min_value=0, value=0, step=10000,
-                                       help="Total WHT deducted by clients (from your WHT certificates)")
+        wht_credits = st.number_input("WHT Already Deducted (₦)", min_value=0, value=0, step=10000)
     
     with col2:
-        # Calculate
         result = calculate_contractor_tax(
-            gross_revenue=gross_revenue,
-            business_expenses=expenses,
-            voluntary_pension=vol_pension,
-            life_assurance=life_assurance,
-            wht_credits=wht_credits
+            gross_revenue=gross_revenue, business_expenses=expenses,
+            voluntary_pension=vol_pension, life_assurance=life_assurance, wht_credits=wht_credits
         )
         
         st.markdown("### 📊 Tax Summary")
-        
-        # Key metrics
-        metric_col1, metric_col2 = st.columns(2)
-        with metric_col1:
+        m1, m2 = st.columns(2)
+        with m1:
             st.metric("Net Tax Payable", format_currency(result["net_tax_payable"]))
-            st.metric("Effective Rate (Revenue)", f"{result['effective_rate_revenue']:.2f}%")
-        with metric_col2:
+            st.metric("Effective Rate", f"{result['effective_rate_revenue']:.2f}%")
+        with m2:
             st.metric("Gross Profit", format_currency(result["gross_profit"]))
             st.metric("Profit Margin", f"{result['profit_margin']:.1f}%")
         
-        # Alerts
         if result["wht_refund"] > 0:
             st.success(f"💰 **WHT Refund Available:** {format_currency(result['wht_refund'])}")
-        
         if result["vat_registration_required"]:
-            st.warning("⚠️ **VAT Registration Required** - Your turnover exceeds ₦25M")
-        
+            st.warning("⚠️ **VAT Registration Required** - Turnover exceeds ₦25M")
         if result["qualifies_small_company"]:
-            st.info("✅ You qualify as a **Small Company** (0% CIT if incorporated)")
+            st.info("✅ Qualifies as **Small Company** (0% CIT if incorporated)")
         
         st.markdown("---")
-        
-        # Calculation breakdown
         st.markdown("#### 📋 Calculation Breakdown")
-        
-        summary_data = [
+        summary = [
             {"Item": "Gross Revenue", "Amount": format_currency(gross_revenue)},
             {"Item": "(-) Business Expenses", "Amount": format_currency(result["expenses"]["total"])},
             {"Item": "= Gross Profit", "Amount": format_currency(result["gross_profit"])},
@@ -396,15 +548,7 @@ elif page == "🧑‍💻 Contractor Calculator":
             {"Item": "(-) WHT Credits", "Amount": format_currency(wht_credits)},
             {"Item": "**= Net Tax Payable**", "Amount": f"**{format_currency(result['net_tax_payable'])}**"},
         ]
-        st.dataframe(pd.DataFrame(summary_data), hide_index=True, use_container_width=True)
-        
-        # Tax by band
-        st.markdown("#### 🧮 Tax Calculation by Band")
-        tax_df = pd.DataFrame(result["tax_breakdown"])
-        tax_df["taxable_amount"] = tax_df["taxable_amount"].apply(format_currency)
-        tax_df["tax"] = tax_df["tax"].apply(format_currency)
-        tax_df.columns = ["Tax Band", "Rate", "Taxable Amount", "Tax Due"]
-        st.dataframe(tax_df, hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
 
 
 # ============================================
@@ -413,76 +557,39 @@ elif page == "🧑‍💻 Contractor Calculator":
 elif page == "⚖️ Compare Options":
     st.markdown("## ⚖️ Employee vs Contractor Comparison")
     st.markdown("See how your tax differs when receiving income as salary vs. contractor fees.")
-    
     st.markdown("---")
     
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        st.markdown("### 💵 Enter Annual Amount")
-        gross_amount = st.number_input("Total Annual Amount (₦)", min_value=1000000, 
-                                        value=6000000, step=500000)
-        
-        expense_ratio = st.slider("Estimated Business Expenses (%)", min_value=10, max_value=60, 
-                                   value=30, help="As a contractor, what % of revenue goes to expenses?")
-        
-        st.info("""
-        **Assumptions:**
-        - Employee: Standard 50/25/15/10 salary structure
-        - Contractor: 5% WHT deducted, 8% voluntary pension
-        """)
+        gross_amount = st.number_input("Total Annual Amount (₦)", min_value=1000000, value=6000000, step=500000)
+        expense_ratio = st.slider("Business Expenses (%)", min_value=10, max_value=60, value=30)
+        st.info("**Assumptions:**\n- Employee: 50/25/15/10 structure\n- Contractor: 5% WHT, 8% pension")
     
     with col2:
         result = compare_salary_vs_contractor(gross_amount, expense_ratio / 100)
         
-        st.markdown("### 📊 Comparison Results")
+        st.markdown("### 📊 Results")
+        c1, c2 = st.columns(2)
         
-        comp_col1, comp_col2 = st.columns(2)
-        
-        with comp_col1:
+        with c1:
             st.markdown("#### 💼 As Employee")
             st.metric("Annual Tax", format_currency(result["employee"]["annual_tax"]))
             st.metric("Effective Rate", f"{result['employee']['effective_rate']:.2f}%")
             st.metric("Net Income", format_currency(result["employee"]["net_income"]))
         
-        with comp_col2:
+        with c2:
             st.markdown("#### 🧑‍💻 As Contractor")
             st.metric("Annual Tax", format_currency(result["contractor"]["annual_tax"]))
             st.metric("Effective Rate", f"{result['contractor']['effective_rate']:.2f}%")
             st.metric("Net Income", format_currency(result["contractor"]["net_income"]))
         
         st.markdown("---")
-        
-        # Recommendation
         savings = result["tax_savings_as_contractor"]
         if savings > 0:
-            st.success(f"""
-            ### 💡 Recommendation: **{result['recommendation']}**
-            
-            As a contractor, you could save **{format_currency(savings)}** annually in taxes 
-            ({format_currency(savings/12)}/month).
-            
-            This assumes you can legitimately claim {expense_ratio}% in business expenses.
-            """)
+            st.success(f"### 💡 Recommendation: **Contractor**\n\nSave **{format_currency(savings)}** annually ({format_currency(savings/12)}/month)")
         else:
-            st.info(f"""
-            ### 💡 Recommendation: **{result['recommendation']}**
-            
-            As an employee, you would pay **{format_currency(abs(savings))}** less in taxes annually.
-            
-            This is because your expense ratio ({expense_ratio}%) may not offset the deductions available to employees.
-            """)
-        
-        st.markdown("---")
-        st.markdown("#### ⚠️ Important Considerations")
-        st.markdown("""
-        **Beyond tax, consider:**
-        - **Job security:** Employees have more protections
-        - **Benefits:** Pension, health insurance, leave
-        - **Compliance burden:** Contractors must file their own returns
-        - **Multiple income streams:** Contractors can work for multiple clients
-        - **Business expenses:** Must be legitimate and documented
-        """)
+            st.info(f"### 💡 Recommendation: **Employee**\n\nPay **{format_currency(abs(savings))}** less in taxes")
 
 
 # ============================================
@@ -490,127 +597,66 @@ elif page == "⚖️ Compare Options":
 # ============================================
 elif page == "📊 Record Keeper":
     st.markdown("## 📊 Record Keeper")
-    st.markdown("Track your income and expenses for tax purposes. Keep records for **6 years**.")
-    
+    st.markdown("Track income and expenses. Keep records for **6 years**.")
     st.markdown("---")
     
     tab1, tab2, tab3 = st.tabs(["💵 Add Income", "💸 Add Expense", "📋 View Records"])
     
     with tab1:
-        st.markdown("### Add Income Record")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            income_date = st.date_input("Date", value=date.today(), key="income_date")
+        st.markdown("### Add Income")
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            income_date = st.date_input("Date", value=date.today(), key="inc_date")
             income_category = st.selectbox("Category", INCOME_CATEGORIES)
-            income_amount = st.number_input("Amount (₦)", min_value=0, value=0, step=1000, key="income_amt")
-        
-        with col2:
-            income_client = st.text_input("Client/Source", placeholder="e.g., ABC Company Ltd")
-            income_invoice = st.text_input("Invoice/Reference No.", placeholder="e.g., INV-2026-001")
+            income_amount = st.number_input("Amount (₦)", min_value=0, value=0, step=1000, key="inc_amt")
+        with ic2:
+            income_client = st.text_input("Client/Source")
             income_wht = st.number_input("WHT Deducted (₦)", min_value=0, value=0, step=100)
         
-        income_notes = st.text_area("Notes", placeholder="Description of work performed...", key="income_notes")
-        
-        if st.button("➕ Add Income Record", type="primary"):
+        if st.button("➕ Add Income", type="primary"):
             if income_amount > 0:
-                record = {
-                    "date": str(income_date),
-                    "category": income_category,
-                    "amount": income_amount,
-                    "client": income_client,
-                    "invoice": income_invoice,
-                    "wht": income_wht,
-                    "notes": income_notes,
-                    "timestamp": datetime.now().isoformat()
-                }
-                st.session_state.records["income"].append(record)
-                st.success("✅ Income record added!")
-            else:
-                st.error("Please enter an amount greater than 0")
+                st.session_state.records["income"].append({
+                    "date": str(income_date), "category": income_category,
+                    "amount": income_amount, "client": income_client, "wht": income_wht
+                })
+                st.success("✅ Added!")
     
     with tab2:
-        st.markdown("### Add Expense Record")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            expense_date = st.date_input("Date", value=date.today(), key="expense_date")
+        st.markdown("### Add Expense")
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            expense_date = st.date_input("Date", value=date.today(), key="exp_date")
             expense_category = st.selectbox("Category", EXPENSE_CATEGORIES)
-            expense_amount = st.number_input("Amount (₦)", min_value=0, value=0, step=100, key="expense_amt")
+            expense_amount = st.number_input("Amount (₦)", min_value=0, value=0, step=100, key="exp_amt")
+        with ec2:
+            expense_vendor = st.text_input("Vendor/Payee")
         
-        with col2:
-            expense_vendor = st.text_input("Vendor/Payee", placeholder="e.g., MTN Nigeria")
-            expense_receipt = st.text_input("Receipt No.", placeholder="e.g., RCP-12345")
-        
-        expense_notes = st.text_area("Notes", placeholder="Purpose of expense...", key="expense_notes")
-        
-        if st.button("➕ Add Expense Record", type="primary"):
+        if st.button("➕ Add Expense", type="primary"):
             if expense_amount > 0:
-                record = {
-                    "date": str(expense_date),
-                    "category": expense_category,
-                    "amount": expense_amount,
-                    "vendor": expense_vendor,
-                    "receipt": expense_receipt,
-                    "notes": expense_notes,
-                    "timestamp": datetime.now().isoformat()
-                }
-                st.session_state.records["expenses"].append(record)
-                st.success("✅ Expense record added!")
-            else:
-                st.error("Please enter an amount greater than 0")
+                st.session_state.records["expenses"].append({
+                    "date": str(expense_date), "category": expense_category,
+                    "amount": expense_amount, "vendor": expense_vendor
+                })
+                st.success("✅ Added!")
     
     with tab3:
-        st.markdown("### Your Records")
-        
-        # Summary metrics
         total_income = sum(r["amount"] for r in st.session_state.records["income"])
         total_expenses = sum(r["amount"] for r in st.session_state.records["expenses"])
         total_wht = sum(r.get("wht", 0) for r in st.session_state.records["income"])
         
-        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-        with metric_col1:
-            st.metric("Total Income", format_currency(total_income))
-        with metric_col2:
-            st.metric("Total Expenses", format_currency(total_expenses))
-        with metric_col3:
-            st.metric("Net Profit", format_currency(total_income - total_expenses))
-        with metric_col4:
-            st.metric("WHT Credits", format_currency(total_wht))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Income", format_currency(total_income))
+        m2.metric("Expenses", format_currency(total_expenses))
+        m3.metric("Net Profit", format_currency(total_income - total_expenses))
+        m4.metric("WHT Credits", format_currency(total_wht))
         
-        st.markdown("---")
-        
-        # Income records
-        st.markdown("#### 💵 Income Records")
         if st.session_state.records["income"]:
-            income_df = pd.DataFrame(st.session_state.records["income"])
-            income_df["amount"] = income_df["amount"].apply(format_currency)
-            income_df["wht"] = income_df["wht"].apply(format_currency)
-            st.dataframe(income_df[["date", "category", "client", "amount", "wht", "invoice"]], 
-                        hide_index=True, use_container_width=True)
-        else:
-            st.info("No income records yet. Add your first record above!")
+            st.markdown("#### 💵 Income")
+            st.dataframe(pd.DataFrame(st.session_state.records["income"]), hide_index=True, use_container_width=True)
         
-        # Expense records
-        st.markdown("#### 💸 Expense Records")
         if st.session_state.records["expenses"]:
-            expense_df = pd.DataFrame(st.session_state.records["expenses"])
-            expense_df["amount"] = expense_df["amount"].apply(format_currency)
-            st.dataframe(expense_df[["date", "category", "vendor", "amount", "receipt"]], 
-                        hide_index=True, use_container_width=True)
-        else:
-            st.info("No expense records yet. Add your first record above!")
-        
-        # Export
-        st.markdown("---")
-        if st.button("📥 Export Records (JSON)"):
-            export_data = json.dumps(st.session_state.records, indent=2)
-            st.download_button(
-                label="Download JSON",
-                data=export_data,
-                file_name=f"taxready_records_{date.today()}.json",
-                mime="application/json"
-            )
+            st.markdown("#### 💸 Expenses")
+            st.dataframe(pd.DataFrame(st.session_state.records["expenses"]), hide_index=True, use_container_width=True)
 
 
 # ============================================
@@ -618,72 +664,34 @@ elif page == "📊 Record Keeper":
 # ============================================
 elif page == "✅ Compliance Checklist":
     st.markdown("## ✅ Tax Compliance Checklist")
-    st.markdown("Stay on top of your tax obligations with this interactive checklist.")
-    
     st.markdown("---")
     
-    # Registration
-    st.markdown("### 📋 Registration & Documentation")
+    st.markdown("### 📋 Registration")
+    st.checkbox("TIN registered and verified")
+    st.checkbox("Business registered with CAC (if applicable)")
+    st.checkbox("VAT registered (if turnover > ₦25M)")
+    st.checkbox("Pension RSA set up")
     
-    reg_items = [
-        ("TIN registered and verified", "Verify at tinverification.jtb.gov.ng"),
-        ("Business registered with CAC (if applicable)", "Required for companies"),
-        ("VAT registered (if turnover > ₦25M)", "Mandatory for eligible businesses"),
-        ("Separate business bank account", "Recommended for clean records"),
-        ("Pension RSA set up", "Required for employees, optional for contractors"),
-    ]
-    
-    for item, help_text in reg_items:
-        st.checkbox(item, help=help_text, key=f"reg_{item}")
-    
-    st.markdown("---")
-    
-    # Monthly obligations
-    st.markdown("### 📅 Monthly Obligations")
-    
+    st.markdown("### 📅 Monthly")
     current_month = MONTHS[datetime.now().month - 1]
-    st.info(f"**Current Month:** {current_month} {datetime.now().year}")
+    st.checkbox(f"PAYE remitted for {current_month}")
+    st.checkbox(f"VAT filed for {current_month}")
+    st.checkbox(f"WHT remitted for {current_month}")
     
-    monthly_items = [
-        (f"PAYE remitted for {current_month}", "Due: 10th of following month"),
-        (f"VAT filed for {current_month}", "Due: 21st of following month"),
-        (f"WHT remitted for {current_month}", "Due: 21st of following month"),
-        (f"Income recorded for {current_month}", "Keep records updated"),
-        (f"Expenses documented for {current_month}", "Keep receipts for 6 years"),
-    ]
-    
-    for item, help_text in monthly_items:
-        st.checkbox(item, help=help_text, key=f"monthly_{item}")
+    st.markdown("### 📆 Annual")
+    st.checkbox("Annual tax return filed")
+    st.checkbox("All WHT certificates collected")
+    st.checkbox("Tax clearance certificate obtained")
     
     st.markdown("---")
-    
-    # Annual obligations
-    st.markdown("### 📆 Annual Obligations (2026)")
-    
-    annual_items = [
-        ("Annual tax return filed", "Due within 6 months of year end"),
-        ("Form H1 submitted (employers)", "Due: January 31"),
-        ("All WHT certificates collected", "Valid for 24 months"),
-        ("Financial statements prepared", "Required for companies"),
-        ("Tax clearance certificate obtained", "For contracts and banking"),
-    ]
-    
-    for item, help_text in annual_items:
-        st.checkbox(item, help=help_text, key=f"annual_{item}")
-    
-    st.markdown("---")
-    
-    # Penalties reminder
-    st.markdown("### ⚠️ Penalty Reminder")
-    
-    penalty_df = pd.DataFrame([
-        {"Violation": "Late filing (first offense)", "Penalty": "₦50,000"},
+    st.markdown("### ⚠️ Penalties")
+    penalties_df = pd.DataFrame([
+        {"Violation": "Late filing (first)", "Penalty": "₦50,000"},
         {"Violation": "Late filing (subsequent)", "Penalty": "₦25,000/month"},
         {"Violation": "Engaging unregistered contractor", "Penalty": "₦5,000,000"},
-        {"Violation": "Failure to register TIN", "Penalty": "Up to ₦50,000"},
         {"Violation": "Failure to deduct WHT", "Penalty": "200% of amount"},
     ])
-    st.dataframe(penalty_df, hide_index=True, use_container_width=True)
+    st.dataframe(penalties_df, hide_index=True, use_container_width=True)
 
 
 # ============================================
@@ -691,370 +699,136 @@ elif page == "✅ Compliance Checklist":
 # ============================================
 elif page == "📚 Learn":
     st.markdown("## 📚 Tax Knowledge Hub")
-    st.markdown("Everything you need to know about Nigeria's 2026 tax laws.")
-    
     st.markdown("---")
     
     topic = st.selectbox("Choose a topic:", [
-        "Overview: What Changed in 2026?",
-        "For Employees: Understanding PAYE",
-        "For Contractors: Tax Optimization",
-        "Allowable Deductions Explained",
-        "WHT: What You Need to Know",
-        "VAT Basics",
-        "Penalties to Avoid",
-        "Frequently Asked Questions"
+        "What Changed in 2026?",
+        "Understanding PAYE",
+        "Contractor Tax Optimization",
+        "Allowable Deductions",
+        "WHT Explained",
+        "Penalties to Avoid"
     ])
     
-    if topic == "Overview: What Changed in 2026?":
+    if topic == "What Changed in 2026?":
         st.markdown("""
-        ### The Nigeria Tax Act 2025: Key Changes
-        
-        The Nigeria Tax Act 2025, signed on June 26, 2025, is the most comprehensive tax reform in decades.
-        It takes effect **January 1, 2026**.
-        
-        #### What Was Consolidated
-        The new Act replaces 12+ separate laws:
-        - Personal Income Tax Act (PITA)
-        - Companies Income Tax Act (CITA)
-        - Value Added Tax Act
-        - Capital Gains Tax Act
-        - Petroleum Profits Tax Act
-        - Stamp Duties Act
-        
-        #### Key Changes for Individuals
+        ### Key Changes in Nigeria Tax Act 2025
         
         | Before (2025) | After (2026) |
         |---------------|--------------|
-        | Tax-free threshold: ~₦300K | Tax-free threshold: **₦800K** |
-        | Consolidated Relief Allowance (complex) | Rent Relief (simple: 20%, max ₦500K) |
-        | Top rate at ₦3.2M threshold | Top rate at ₦50M threshold |
-        | Maximum rate: 24% | Maximum rate: 25% |
+        | Tax-free: ~₦300K | Tax-free: **₦800K** |
+        | CRA (complex) | Rent Relief (simple) |
+        | Top rate at ₦3.2M | Top rate at ₦50M |
+        | Max rate: 24% | Max rate: 25% |
         
-        #### Key Changes for Businesses
-        
-        - **Small companies** (turnover ≤₦100M, assets ≤₦250M): **0% CIT**
-        - **Medium companies** (₦100M-₦500M): 20% CIT
-        - **Large companies** (>₦500M): 30% CIT
-        - **E-invoicing** mandatory for VAT-registered businesses
-        - **WHT credits** valid for 24 months (can offset tax)
-        
-        #### Stricter Enforcement
-        
+        **For Businesses:**
+        - Small companies (≤₦100M turnover): **0% CIT**
+        - Medium companies (₦100M-₦500M): 20%
+        - Large companies (>₦500M): 30%
         - **₦5M penalty** for engaging unregistered contractors
-        - TIN now **mandatory** for bank accounts
-        - NRS has AI tools to cross-reference bank data with tax filings
         """)
     
-    elif topic == "For Employees: Understanding PAYE":
+    elif topic == "Understanding PAYE":
         st.markdown("""
-        ### PAYE (Pay As You Earn) Explained
-        
-        PAYE is how income tax is collected from employees. Your employer deducts it from your salary
-        and remits it to the tax authority.
-        
-        #### How It's Calculated
+        ### PAYE Calculation Formula
         
         ```
         Gross Income
         - Pension (8%)
-        - NHF (2.5% of basic)
+        - NHF (2.5% of basic, max ₦2,400/yr)
         - NHIS (5% of basic)
-        - Rent Relief (20% of gross, max ₦500K)
-        - Life Assurance (max ₦100K)
+        - Rent Relief (20%, max ₦500K)
         = Taxable Income
         × Tax Rates (0% to 25%)
-        = Annual Tax
-        ÷ 12
-        = Monthly PAYE
+        = Annual Tax ÷ 12 = Monthly PAYE
         ```
         
-        #### What's Taxable
-        - Basic salary
-        - Housing allowance
-        - Transport allowance
-        - Bonuses
-        - Benefits-in-kind (company car, housing)
-        
-        #### What's NOT Taxable
-        - Reimbursement of actual expenses
-        - Meal subsidies/vouchers
-        - Uniforms and work tools
-        - Medical expenses paid by employer
-        - Retirement benefits under PRA
-        
-        #### Tips to Reduce Your Tax
-        1. Ensure your employer applies Rent Relief
-        2. Take out a life assurance policy (up to ₦100K deductible)
+        **Tips to reduce tax:**
+        1. Ensure Rent Relief is applied
+        2. Take life assurance (up to ₦100K deductible)
         3. Maximize pension contributions
-        4. If you have a mortgage, claim interest deduction
+        4. Claim mortgage interest if applicable
         """)
     
-    elif topic == "For Contractors: Tax Optimization":
+    elif topic == "Contractor Tax Optimization":
         st.markdown("""
-        ### Tax Strategies for Independent Contractors
+        ### Contractor Advantages
         
-        As a contractor, you have more control over your tax liability than employees.
+        Unlike employees, contractors deduct ALL business expenses:
+        - Office rent, utilities, internet
+        - Equipment, software, subscriptions
+        - Professional fees, training
+        - Business travel
         
-        #### The Big Advantage: Business Expenses
-        
-        Unlike employees, you can deduct ALL legitimate business expenses:
-        
-        | Category | Examples |
-        |----------|----------|
-        | Premises | Office rent, utilities, maintenance |
-        | Equipment | Computers, furniture, software |
-        | Communications | Internet, phone, data |
-        | Professional | Accounting, legal, subscriptions |
-        | Marketing | Ads, website, business cards |
-        | Travel | Fuel, flights, hotels (business only) |
-        | Personnel | Subcontractors, assistants |
-        
-        #### The Formula for Lower Taxes
-        
+        **Optimization Formula:**
         ```
-        Revenue
-        - Business Expenses (document everything!)
-        = Gross Profit
-        - Rent Relief (20%, max ₦500K)
-        - Voluntary Pension (up to 8%)
-        - Life Assurance (max ₦100K)
-        = Taxable Income
-        - WHT Credits (from clients)
-        = Net Tax Payable
+        Revenue - Expenses = Profit
+        Profit - Reliefs = Taxable Income
+        Tax - WHT Credits = Net Tax Payable
         ```
         
-        #### Top Optimization Strategies
-        
-        1. **Document EVERYTHING** — No receipt = no deduction
-        2. **Maximize legitimate expenses** — Home office, vehicle, training
-        3. **Contribute to pension** — Tax-deductible AND builds retirement
-        4. **Collect ALL WHT certificates** — They offset your tax for 24 months
-        5. **Time your income** — If near threshold, consider timing of invoices
-        
-        #### Warning Signs for Audits
-        - Expense ratio much higher than industry average
-        - Large cash transactions
-        - Mismatch between bank deposits and declared income
+        **Key strategies:**
+        1. Document EVERYTHING
+        2. Collect ALL WHT certificates (valid 24 months)
+        3. Contribute to voluntary pension (tax-deductible)
         """)
     
-    elif topic == "Allowable Deductions Explained":
+    elif topic == "Allowable Deductions":
         st.markdown("""
-        ### Complete Guide to Allowable Deductions
+        ### Employee Deductions
+        | Deduction | Rate/Cap |
+        |-----------|----------|
+        | Pension | 8% |
+        | NHF | 2.5% (max ₦2,400/yr) |
+        | NHIS | 5% |
+        | Rent Relief | 20% (max ₦500K) |
+        | Life Assurance | Max ₦100K |
         
-        #### For Employees (Automatic)
-        
-        | Deduction | Rate | Cap |
-        |-----------|------|-----|
-        | Pension | 8% of (Basic + Housing + Transport) | None |
-        | NHF | 2.5% of Basic | ₦2,400/year |
-        | NHIS | 5% of Basic | None |
-        | Rent Relief | 20% of Gross | ₦500,000 |
-        | Life Assurance | Actual | ₦100,000 |
-        | Mortgage Interest | Actual | None |
-        
-        #### For Contractors (Must Document)
-        
-        **Office & Premises**
-        - Rent (proportional if home office)
-        - Utilities (proportional)
-        - Internet
-        - Maintenance
-        
-        **Equipment & Tools**
-        - Computers, phones
-        - Software subscriptions
-        - Furniture
-        - Capital allowances (25%/year for equipment)
-        
-        **Professional Services**
-        - Accounting fees
-        - Legal fees
-        - Professional subscriptions
-        - Training and development
-        
-        **Travel & Transport**
-        - Business travel (with log book)
-        - Fuel (business portion)
-        - Vehicle maintenance (business portion)
-        - Flights and accommodation
-        
-        #### What's NOT Deductible
-        - Personal expenses
-        - Entertainment (except direct client meetings)
-        - Fines and penalties
-        - Political contributions
-        - Expenses without documentation
+        ### Contractor Deductions
+        - All business expenses with receipts
+        - Capital allowances (25%/yr for equipment)
+        - Professional fees and subscriptions
+        - Business travel and transport
         """)
     
-    elif topic == "WHT: What You Need to Know":
+    elif topic == "WHT Explained":
         st.markdown("""
-        ### Withholding Tax (WHT) Explained
-        
-        WHT is tax deducted at source when payments are made.
-        
-        #### Who Deducts WHT?
-        Companies paying for services must deduct WHT and remit to NRS.
-        
-        #### WHT Rates
-        
+        ### Withholding Tax Rates
         | Payment Type | Rate |
         |--------------|------|
         | Professional services | 10% |
         | Consultancy | 10% |
-        | Technical services | 10% |
         | Contracts | 5% |
         | Supplies | 5% |
         | Rent | 10% |
-        | Dividends | 10% |
-        | Interest | 10% |
         
-        #### For Contractors: WHT is a CREDIT, Not Final Tax
+        **Important:** WHT is a CREDIT, not final tax!
         
-        This is crucial: WHT is NOT your final tax liability. It's an advance payment.
+        If your actual tax < WHT deducted → You get a **refund**
         
-        **Example:**
-        - You earn ₦1,000,000 from a client
-        - Client deducts 10% WHT = ₦100,000
-        - You receive ₦900,000
-        - At year end, your actual tax is ₦80,000
-        - You get ₦20,000 REFUND (or credit against next year)
-        
-        #### Important Rules
-        - WHT certificates are valid for **24 months**
-        - Always collect certificates from clients
-        - Keep organized records by date and client
-        - Report all WHT credits on your annual return
-        """)
-    
-    elif topic == "VAT Basics":
-        st.markdown("""
-        ### VAT: What You Need to Know
-        
-        #### The Basics
-        - Rate: **7.5%**
-        - Registration threshold: **₦25M annual turnover**
-        - Filing: Monthly, by 21st of following month
-        
-        #### Do You Need to Register?
-        
-        **Yes, if:**
-        - Annual turnover exceeds ₦25 million
-        - You supply taxable goods or services
-        
-        **No, if:**
-        - Turnover below ₦25 million
-        - You only supply exempt items
-        
-        #### VAT-Exempt Items
-        - Basic food items
-        - Medical supplies
-        - Educational materials
-        - Books and newspapers
-        - Baby products
-        - Fertilizers
-        
-        #### Input VAT Recovery (New in 2026)
-        
-        You can now recover VAT paid on:
-        - Goods purchased for business
-        - Services used in business
-        - **Fixed assets** (NEW — previously not allowed)
-        
-        #### E-Invoicing Requirement
-        
-        From 2026, VAT-registered businesses must use NRS-approved
-        e-invoicing systems. Start preparing now!
+        WHT certificates valid for **24 months**
         """)
     
     elif topic == "Penalties to Avoid":
         st.markdown("""
-        ### Tax Penalties: What to Avoid
-        
-        #### Registration Penalties
-        
+        ### Penalty Schedule
         | Violation | Penalty |
         |-----------|---------|
-        | Failure to register TIN | Up to ₦50,000 |
-        | Failure to notify address change | ₦25,000 |
-        | Operating without TIN | Restrictions on banking |
-        
-        #### Filing Penalties
-        
-        | Violation | Penalty |
-        |-----------|---------|
-        | Late filing (first month) | ₦50,000 |
+        | Late filing (first) | ₦50,000 |
         | Late filing (subsequent) | ₦25,000/month |
-        | False returns | ₦500,000 + up to 5 years imprisonment |
-        
-        #### Payment Penalties
-        
-        | Violation | Penalty |
-        |-----------|---------|
-        | Late payment | 10% p.a. + interest at CBN MPR |
-        | Under-remittance of PAYE | 10% of amount + interest |
-        | Failure to deduct WHT | **200% of amount** |
-        
-        #### Contractor-Related Penalties
-        
-        | Violation | Penalty |
-        |-----------|---------|
-        | **Engaging unregistered contractor** | **₦5,000,000** |
-        | Not obtaining TIN before payment | ₦5,000,000 |
-        
-        #### How to Stay Safe
-        
-        1. Register and verify TIN immediately
-        2. File on time (even if you can't pay full amount)
-        3. Always verify contractor TINs before payment
-        4. Keep records for 6 years
-        5. When in doubt, consult a tax professional
-        """)
-    
-    elif topic == "Frequently Asked Questions":
-        st.markdown("""
-        ### Frequently Asked Questions
-        
-        **Q: Has the VAT rate changed?**
-        A: No, VAT remains at 7.5%.
-        
-        **Q: Do I need to re-register my business?**
-        A: No. Keep your existing CAC registration and TIN.
-        
-        **Q: When do the new rules start?**
-        A: January 1, 2026.
-        
-        **Q: What happened to Consolidated Relief Allowance?**
-        A: CRA is abolished. It's replaced by Rent Relief (20% of gross, max ₦500K).
-        
-        **Q: I earn below ₦800K/year. Do I pay tax?**
-        A: No. The first ₦800,000 is completely tax-free.
-        
-        **Q: I'm a contractor. Can I still deduct expenses?**
-        A: Yes! All legitimate business expenses remain deductible.
-        
-        **Q: What if I haven't been paying tax?**
-        A: Register immediately. Consider voluntary disclosure
-        to reduce penalties. Consult a tax professional.
-        
-        **Q: How long must I keep records?**
-        A: 6 years minimum.
-        
-        **Q: Can I offset WHT against my tax?**
-        A: Yes! WHT credits are valid for 24 months.
-        
-        **Q: Do I need an accountant?**
-        A: Recommended if turnover exceeds ₦30M or you have
-        complex affairs. Otherwise, tools like TaxReady can help.
+        | Unregistered contractor | **₦5,000,000** |
+        | No TIN | Up to ₦50,000 |
+        | Failure to deduct WHT | 200% of amount |
+        | False returns | ₦500K + 5 years |
         """)
 
 
 # Footer
 st.markdown("---")
 st.markdown("""
-<div style='text-align: center; color: #666; font-size: 0.8rem;'>
-    <p>TaxReady Nigeria | Built for the Nigeria Tax Act 2025</p>
-    <p>⚠️ This tool provides estimates only. Consult a qualified tax professional for advice.</p>
-    <p>© 2025 | Made with ❤️ for Nigerian businesses</p>
+<div style='text-align: center; color: #666; font-size: 0.85rem;'>
+TaxReady Nigeria | Built for Nigeria Tax Act 2025<br>
+⚠️ Estimates only. Consult a tax professional for advice.<br>
+© 2025 | Made with ❤️ for Nigerian businesses
 </div>
 """, unsafe_allow_html=True)
