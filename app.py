@@ -1002,7 +1002,7 @@ elif page == "📚 Learn":
     st.markdown("## 📚 Learn")
     st.markdown("---")
     
-    topic = st.selectbox("Topic:", ["What Changed in 2026?", "PAYE Explained", "Contractor Tips", "Deductions", "WHT Guide", "Penalties"])
+    topic = st.selectbox("Topic:", ["What Changed in 2026?", "How to Register as Contractor", "PAYE Explained", "Contractor Tips", "Deductions", "WHT Guide", "Penalties"])
     
     if topic == "What Changed in 2026?":
         st.markdown("""
@@ -1018,6 +1018,109 @@ elif page == "📚 Learn":
         - Small (≤₦100M): **0% CIT**
         - Medium (₦100-500M): 20%
         - Large (>₦500M): 30%
+        """)
+    
+    elif topic == "How to Register as Contractor":
+        st.markdown("### Contractor Registration Guide (2026)")
+        
+        st.markdown("""
+        Under the Nigeria Tax Act 2025, all contractors must be tax-registered. 
+        Clients face **₦5 million penalty** for engaging unregistered contractors.
+        """)
+        
+        st.markdown("#### Choose Your Path")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("""
+            **🧑 Path 1: Individual TIN**
+            
+            Best for: Freelancers, side hustlers
+            
+            Cost: **Free**
+            
+            Timeline: 1-3 days
+            
+            **Steps:**
+            1. Your NIN = Your Tax ID
+            2. Link TIN to bank account
+            3. File annual returns
+            """)
+        
+        with col2:
+            st.markdown("""
+            **🏢 Path 2: Business Name (CAC)**
+            
+            Best for: Serious contractors
+            
+            Cost: **~₦10,500**
+            
+            Timeline: 3-7 days
+            
+            **Steps:**
+            1. Register at CAC portal
+            2. Get TIN (auto or apply)
+            3. Open business bank account
+            """)
+        
+        st.markdown("---")
+        st.markdown("#### Step-by-Step: CAC Business Name Registration")
+        
+        st.markdown("""
+        | Step | Action | Cost |
+        |------|--------|------|
+        | 1 | Create account at [cac.gov.ng](https://cac.gov.ng) | Free |
+        | 2 | Search & reserve business name | ₦500 |
+        | 3 | Complete Form CAC-BNo1 | — |
+        | 4 | Upload ID + passport photo | — |
+        | 5 | Pay filing fee | ₦10,000 |
+        | 6 | Receive certificate | 3-7 days |
+        
+        **Documents Needed:**
+        - Valid ID (NIN, passport, or driver's license)
+        - Passport photograph
+        - Business address
+        - Two proposed business names
+        """)
+        
+        st.markdown("---")
+        st.markdown("#### Getting Your TIN")
+        
+        st.markdown("""
+        **Option A: Use Your NIN** (Simplest)
+        
+        Under the new law, your NIN serves as your Tax ID. If you have an NIN, you're covered for basic compliance.
+        
+        **Option B: Apply at FIRS/JTB** (If needed)
+        
+        1. Visit JTB portal or FIRS office
+        2. Select "Individual" registration  
+        3. Provide: NIN, BVN, full name, address
+        4. Upload valid ID
+        5. Receive TIN via email (1-3 days)
+        
+        ⚠️ **Cost is FREE** — don't pay touts or agents!
+        """)
+        
+        st.markdown("---")
+        st.markdown("#### Ongoing Compliance")
+        
+        st.markdown("""
+        | Obligation | Frequency | Deadline |
+        |------------|-----------|----------|
+        | File tax return | Annual | March 31 |
+        | Remit WHT | Monthly | 21st |
+        | VAT filing (if >₦25M) | Monthly | 21st |
+        | CAC annual return | Annual | ₦3,000 |
+        | Keep records | Ongoing | 6 years |
+        """)
+        
+        st.warning("""
+        **⚠️ Critical 2026 Requirements:**
+        - TIN mandatory for bank accounts (Jan 1, 2026)
+        - Annual filing compulsory — even if no tax due
+        - Separate business and personal bank accounts
+        - Digital transactions are now tracked by tax authorities
         """)
     
     elif topic == "PAYE Explained":
